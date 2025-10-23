@@ -8,6 +8,9 @@
 (define-constant ERR_PROPOSAL_ENDED (err u106))
 (define-constant ERR_PROPOSAL_ACTIVE (err u107))
 (define-constant ERR_INVALID_OPTION (err u108))
+(define-constant ERR_CANNOT_DELEGATE_SELF (err u109))
+(define-constant ERR_DELEGATION_EXISTS (err u110))
+(define-constant ERR_NO_DELEGATION (err u111))
 
 (define-constant PROPOSAL_TYPE_UNIFORM u1)
 (define-constant PROPOSAL_TYPE_CHARITY u2)
@@ -58,6 +61,11 @@
   { winning-option: uint, total-participants: uint, finalized-at: uint }
 )
 
+(define-map delegations
+  { delegator: principal, proposal-id: uint }
+  { delegate: principal, delegated-at: uint }
+)
+
 (define-read-only (get-admin)
   (var-get admin)
 )
@@ -88,6 +96,14 @@
 
 (define-read-only (get-proposal-result (proposal-id uint))
   (map-get? proposal-results { proposal-id: proposal-id })
+)
+
+(define-read-only (get-delegation (delegator principal) (proposal-id uint))
+  (map-get? delegations { delegator: delegator, proposal-id: proposal-id })
+)
+
+(define-read-only (has-delegated (delegator principal) (proposal-id uint))
+  (is-some (get-delegation delegator proposal-id))
 )
 
 (define-read-only (is-proposal-active (proposal-id uint))
@@ -226,6 +242,7 @@
         (option (unwrap! (get-proposal-option proposal-id option-id) ERR_INVALID_OPTION)))
     (asserts! (is-proposal-active proposal-id) ERR_PROPOSAL_INACTIVE)
     (asserts! (not (has-user-voted proposal-id tx-sender)) ERR_ALREADY_VOTED)
+    (asserts! (not (has-delegated tx-sender proposal-id)) ERR_DELEGATION_EXISTS)
     (asserts! (and (>= option-id u1) (<= option-id u4)) ERR_INVALID_OPTION)
     
     (map-set votes
@@ -314,6 +331,78 @@
       (merge proposal { 
         end-block: (+ (get end-block proposal) additional-blocks)
       })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (delegate-vote (proposal-id uint) (delegate principal))
+  (let ((proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        (current-block (var-get current-block-height)))
+    (asserts! (is-proposal-active proposal-id) ERR_PROPOSAL_INACTIVE)
+    (asserts! (not (is-eq tx-sender delegate)) ERR_CANNOT_DELEGATE_SELF)
+    (asserts! (not (has-user-voted proposal-id tx-sender)) ERR_ALREADY_VOTED)
+    (asserts! (not (has-delegated tx-sender proposal-id)) ERR_DELEGATION_EXISTS)
+    
+    (map-set delegations
+      { delegator: tx-sender, proposal-id: proposal-id }
+      { delegate: delegate, delegated-at: current-block }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (revoke-delegation (proposal-id uint))
+  (let ((delegation (unwrap! (get-delegation tx-sender proposal-id) ERR_NO_DELEGATION))
+        (delegate (get delegate delegation)))
+    (asserts! (is-proposal-active proposal-id) ERR_PROPOSAL_INACTIVE)
+    (asserts! (not (has-user-voted proposal-id delegate)) ERR_ALREADY_VOTED)
+    
+    (map-delete delegations { delegator: tx-sender, proposal-id: proposal-id })
+    
+    (ok true)
+  )
+)
+
+(define-public (vote-as-delegate (proposal-id uint) (delegator principal) (option-id uint))
+  (let ((proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        (current-block (var-get current-block-height))
+        (option (unwrap! (get-proposal-option proposal-id option-id) ERR_INVALID_OPTION))
+        (delegation (unwrap! (get-delegation delegator proposal-id) ERR_NO_DELEGATION)))
+    (asserts! (is-proposal-active proposal-id) ERR_PROPOSAL_INACTIVE)
+    (asserts! (is-eq tx-sender (get delegate delegation)) ERR_UNAUTHORIZED)
+    (asserts! (not (has-user-voted proposal-id delegator)) ERR_ALREADY_VOTED)
+    (asserts! (and (>= option-id u1) (<= option-id u4)) ERR_INVALID_OPTION)
+    
+    (map-set votes
+      { proposal-id: proposal-id, voter: delegator }
+      { option-id: option-id, voted-at: current-block }
+    )
+    
+    (map-set proposal-options
+      { proposal-id: proposal-id, option-id: option-id }
+      { 
+        option-text: (get option-text option),
+        vote-count: (+ (get vote-count option) u1)
+      }
+    )
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { total-votes: (+ (get total-votes proposal) u1) })
+    )
+    
+    (let ((current-stats (default-to { total-votes: u0, last-vote-block: u0 }
+                          (get-voter-stats delegator))))
+      (map-set voter-participation
+        { voter: delegator }
+        {
+          total-votes: (+ (get total-votes current-stats) u1),
+          last-vote-block: current-block
+        }
+      )
     )
     
     (ok true)
